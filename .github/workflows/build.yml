@@ -1,0 +1,158 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Android – debug APK
+  # ─────────────────────────────────────────────
+  android:
+    name: Android Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # RN 0.69.1 requires Node 18 – newer versions break the CLI
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install JS dependencies
+        run: npm install --legacy-peer-deps
+
+      # ─────────────────────────────────────────
+      # ROOT CAUSE FIX
+      # react-native-gesture-handler ≥ 2.x, react-native-screens ≥ 3.x, and
+      # react-native-quick-base64 ship AndroidManifest.xml files WITHOUT a
+      # `package` attribute (valid for AGP 8+). The RN 0.69.1 CLI still uses
+      # the old parser that REQUIRES the attribute. When Gradle calls
+      #   node .../cli/build/bin.js config
+      # the CLI crashes and prints only:
+      #   info Run CLI with --verbose flag for more details.
+      # to stdout. Gradle tries to parse that as JSON → JsonException.
+      # Fix: inject the correct package name into each broken manifest.
+      # ─────────────────────────────────────────
+      - name: Patch AndroidManifest.xml package attributes
+        run: |
+          echo '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.swmansion.gesturehandler" />' \
+            > node_modules/react-native-gesture-handler/android/src/main/AndroidManifest.xml
+
+          echo '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.swmansion.rnscreens" />' \
+            > node_modules/react-native-screens/android/src/main/AndroidManifest.xml
+
+          echo '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.reactnativequickbase64" />' \
+            > node_modules/react-native-quick-base64/android/src/main/AndroidManifest.xml
+
+          echo "✅ Manifests patched. Verifying CLI returns valid JSON..."
+          node node_modules/@react-native-community/cli/build/bin.js config \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ CLI OK, keys:', list(d.keys())[:4])"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Build debug APK
+        run: cd android && ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
+
+      # ── Release / signed build ──────────────────
+      # Uncomment + add secrets to build a signed AAB for the Play Store:
+      #
+      # - name: Decode keystore
+      #   run: |
+      #     echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode \
+      #       > android/app/release.keystore
+      #
+      # - name: Build signed release AAB
+      #   run: |
+      #     cd android && ./gradlew bundleRelease \
+      #       -Pandroid.injected.signing.store.file=release.keystore \
+      #       -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
+      #       -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
+      #       -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+      # ────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # iOS – simulator build (no code-signing)
+  # ─────────────────────────────────────────────
+  ios:
+    name: iOS Build
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install JS dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Set up Ruby (for CocoaPods)
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ hashFiles('ios/Podfile.lock') }}
+          restore-keys: pods-
+
+      - name: Install CocoaPods
+        run: bundle exec pod install --project-directory=ios
+
+      # ── Release / signed build ──────────────────
+      # For a real device IPA, store your cert + provisioning profile as
+      # GitHub secrets, decode them here, then pass CODE_SIGN_IDENTITY and
+      # PROVISIONING_PROFILE to xcodebuild.
+      # ────────────────────────────────────────────
+
+      - name: Build for simulator (no signing)
+        run: |
+          xcodebuild \
+            -workspace ios/BrilliantApp.xcworkspace \
+            -scheme BrilliantApp \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build | xcpretty
+
+      - name: Upload .app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-app
+          path: build/Build/Products/Debug-iphonesimulator/*.app
+          retention-days: 14
